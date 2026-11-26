@@ -1,0 +1,11 @@
+{
+  "off_limits": [".env", ".env.*", "!.env.example", "*.pem", "*.key", "id_rsa*", "secrets/**", "data/exports/**"],
+  "read_only": ["vendor/**"],
+  "locked_once_committed": ["migrations/*.sql", "db/migrate/*.rb"],
+  "protect_tests": true,
+  "block_force_push": true,
+  "block_no_verify": true,
+  "block_destructive_git": true,
+  "block_rm_rf_roots": true,
+  "scan_commits_for_secrets": true
+}

@@ -1,0 +1,12 @@
+{
+  "name": "greenbar",
+  "description": "greenbar: hooks for Claude Code that stop a false \"done\". Free and open source (MIT).",
+  "owner": { "name": "anchorcoteam" },
+  "plugins": [
+    {
+      "name": "greenbar",
+      "source": "./plugins/greenbar",
+      "description": "Claude can't finish a turn while your tests or lint fail, and can't read secrets, weaken tests or force-push. 142-case test suite."
+    }
+  ]
+}

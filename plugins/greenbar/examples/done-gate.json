@@ -1,0 +1,12 @@
+{
+  "checks": [
+    { "name": "tests", "run": "npm test --silent" },
+    { "name": "types", "run": "npx tsc --noEmit" },
+    { "name": "lint", "run": "npx eslint ." }
+  ],
+  "timeout_seconds": 600,
+  "max_consecutive_blocks": 3,
+  "skip_when_unchanged": true,
+  "announce_pass": true,
+  "output_tail_lines": 40
+}
