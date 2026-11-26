@@ -64,7 +64,7 @@ def make_repo(root: Path) -> None:
 
 
 def run_hook(hook: Path, root: Path, event: Dict[str, Any], env: Dict[str, str] = None) -> subprocess.CompletedProcess:
-    full_env = {**os.environ, "CLAUDE_PROJECT_DIR": str(root), **(env or {})}
+    full_env = {**os.environ, "CLAUDE_PROJECT_DIR": str(root), "PYTHONDONTWRITEBYTECODE": "1", **(env or {})}
     full_env.pop("DONE_GATE_OFF", None) if not (env or {}).get("DONE_GATE_OFF") else None
     full_env.pop("DONE_GATE_RUNNING", None)
     return subprocess.run([sys.executable, str(hook)], input=json.dumps(event), text=True,

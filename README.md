@@ -95,13 +95,13 @@ set it up. greenbar writes nothing else.
 - It doesn't stop Claude from writing a weak new test. It does block adding skip markers and deleting test files.
 - Secret scanning is pattern-based. It catches common key formats and quoted passwords, not every secret.
 - Checks run on your machine with your permissions. Only list commands you would run yourself.
-- **Platforms:** tested on macOS (Python 3.9 and 3.15) and on Linux in a container (see `proof/`).
+- **Platforms:** tested on macOS 26 arm64 (Python 3.9 and 3.15, plus a live clean-profile run) and on Linux arm64 in a `python:3.12-slim` container (test suite only; see `proof/`).
   Windows is not supported: the done gate uses `fcntl`.
 
 ## Test it
 
 ```bash
-python3 tests/run_tests.py        # 142 cases, about 30 s, touches only a temp folder
+python3 tests/run_tests.py        # 142 cases, about 1-2 minutes, touches only a temp folder
 python3 tests/run_tests.py -v     # list every case
 ```
 
