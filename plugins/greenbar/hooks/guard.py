@@ -15,7 +15,11 @@ Runs before Claude reads or edits a file, searches, or runs a shell command, and
   6. A `git commit` whose changes contain a never-commit file or something that looks like
      a secret (cloud keys, tokens, private keys, quoted passwords).
 
-Rules live in .claude/guard.json (see guard.example.json). It is a guard rail for an
+Shell commands are read by shell_parse.py (next to this file): it splits the command line
+the way a shell would and hands back each command that would really run, with wrappers such
+as `sudo`, `env` or `timeout 30` stripped and `sh -c '...'`, `eval` and `$(...)` followed.
+
+Rules live in .claude/guard.json (see guard.example.json). It is a seatbelt for an
 assistant, not a sandbox: see README, "What it does not do".
 Turn it off for the repo: touch .claude/guard.off
 """
@@ -25,14 +29,24 @@ from __future__ import annotations
 import fnmatch
 import glob
 import hashlib
+import itertools
 import json
 import os
 import re
 import shlex
+import signal
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
+
+sys.dont_write_bytecode = True  # leave no __pycache__ in the plugin folder
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import shell_parse as sh
+except ImportError as exc:
+    print(f"greenbar guard: shell_parse.py must sit next to guard.py ({exc}); not checked.", file=sys.stderr)
+    sys.exit(1)
 
 DEFAULTS: Dict[str, Any] = {
     "off_limits": [
@@ -60,7 +74,6 @@ SENSITIVE_HOME = (".ssh", ".aws", ".gnupg", ".netrc", ".docker", ".kube", ".pypi
                   ".config/gcloud", ".azure", ".npmrc")
 FILE_TOOLS = {"Read", "Edit", "Write", "MultiEdit", "NotebookEdit"}
 WRITE_TOOLS = FILE_TOOLS - {"Read"}
-SEPARATORS = {";", "&&", "||", "|", "&", "(", ")", "\n"}
 SEARCH_COMMANDS = {"grep", "egrep", "fgrep", "rg", "ag"}
 FILE_COMMANDS = {
     "ls", "cd", "pushd", "find", "tree", "du", "cat", "bat", "head", "tail", "less", "more",
@@ -68,6 +81,8 @@ FILE_COMMANDS = {
     "cp", "mv", "rm", "tar", "zip", "unzip", "rsync", "scp", "open", "diff", "cmp",
     "base64", "nl", "tac", "jq", "column", "iconv", "split", "ln", "chmod", "source", ".",
     "vi", "vim", "nano", "code", "xargs", "env", "dotenv", "shred", "truncate", "tee",
+    "dd", "rev", "paste", "hexdump", "zcat", "gzip", "fold", "fmt", "comm", "ed", "ex",
+    "view", "xz", "bzip2", "install", "ditto",
 }
 CHANGES_ALL_ARGS = {"rm", "mv", "tee", "truncate", "touch", "ln", "chmod", "install",
                     "unlink", "shred"}
@@ -75,7 +90,6 @@ GIT_FILE_CHANGERS = {"mv", "rm", "checkout", "restore"}
 FIND_PATTERN_OPTIONS = {"-path", "-ipath", "-name", "-iname", "-wholename", "-regex", "-iregex"}
 GLOB_CHARS = set("*?[")
 MAX_SCAN_BYTES = 1_000_000
-MESSAGE_ARG = re.compile(r"""(?<!\S)(?:-m|--message)(?:=|\s+)(?:"[^"]*"|'[^']*'|\S+)""")
 GIT_COMMAND = re.compile(r"\bgit\b(?:\s+(?:-[cC]\s*\S+|--?[\w-]+(?:=\S+)?))*\s+(\w[\w-]*)")
 SKIP_MARKER = re.compile(
     r"@pytest\.mark\.(skip|xfail)\b|@unittest\.skip|\bpytest\.skip\(|\bself\.skipTest\(|"
@@ -240,15 +254,17 @@ def names_sensitive_home(text: str) -> bool:
     return bool(re.search(rf"(?:~|\$HOME|\$\{{HOME\}}|{home})/(?:{folders})(?![\w-])", text))
 
 
-def expand(pattern: str) -> List[str]:
-    """Wildcard expansion that, like the shell, also matches hidden files in the last part."""
+def expand(pattern: str, hidden: bool = False) -> List[str]:
+    """Wildcard expansion as the shell does it: `*` skips hidden files, `.e*` finds them."""
     folder, name = os.path.split(pattern)
     if GLOB_CHARS & set(folder):
-        return glob.glob(pattern)[:500]
+        return list(itertools.islice(glob.iglob(pattern), 500))
     try:
         entries = os.listdir(folder or ".")
     except OSError:
         return []
+    if not hidden and not name.startswith("."):
+        entries = [e for e in entries if not e.startswith(".")]
     return [os.path.join(folder, e) for e in fnmatch.filter(entries, name)][:500]
 
 
@@ -341,143 +357,51 @@ def check_search_tool(tool: str, tool_input: Dict[str, Any], root: Path, cfg: Co
 
 
 # ---------- shell ----------
+# shell_parse turns the command text into the commands that would really run (wrappers
+# stripped, `sh -c` strings and $(...) followed); the checks below judge each of those.
 
-def split_words(command: str) -> List[str]:
-    try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
-        lexer.whitespace_split = True
-        return list(lexer)
-    except ValueError:
-        return command.split()
-
-
-def segments(words: List[str]) -> List[range]:
-    out, begin = [], 0
-    for stop in [*(i for i, w in enumerate(words) if w in SEPARATORS), len(words)]:
-        if stop > begin:
-            out.append(range(begin, stop))
-        begin = stop + 1
-    return out
-
-
-def command_name(words: List[str], seg: range) -> str:
-    """The program a segment runs, skipping `sudo`, `env`, `VAR=x` and `command` prefixes."""
-    prefix, skip_next = False, False
-    for i in seg:
-        w = words[i]
-        if skip_next:
-            skip_next = False
-            continue
-        if ("=" in w and not w.startswith("-")) or w in PREFIXES or (prefix and w.startswith("-")):
-            prefix = prefix or w in PREFIXES
-            skip_next = prefix and w in PREFIX_ARG_FLAGS
-            continue
-        return os.path.basename(w)
-    return ""
+PLAIN = frozenset(FILE_COMMANDS | SEARCH_COMMANDS | CHANGES_ALL_ARGS | {
+    "echo", "printf", "git", "test", "[", "[[", "for", "case", "select", "export", "declare",
+    "local", "typeset", "readonly", "alias", "set", "unset", "read", "true", "false", ":",
+    "printenv", "which", "type", "man", "mkdir", "rmdir", "basename", "dirname", "realpath",
+    "readlink", "kill", "sleep", "tr", "seq", "eval", "trap",
+})  # programs whose arguments are data, never another command to run
+SENSITIVE = frozenset(
+    (FILE_COMMANDS | SEARCH_COMMANDS | CHANGES_ALL_ARGS | sh.SHELLS | {"git", "eval", "printenv"})
+    - {".", "install", "cd", "pushd", "env", "xargs", "dotenv"}
+)  # a word that, found among an unknown program's arguments, is checked as a command
+RM_ROOTS = {"/", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "..", "../", ".", "./"}
+MESSAGE_COMMANDS = {"commit", "tag", "merge", "stash", "notes", "revert"}
+MAX_DEPTH, MAX_STRINGS, MAX_SECONDS = 12, 400, 25
+HOME_VARIABLE = re.compile(r"\$\{HOME\}|\$HOME(?!\w)")
+NOT_A_FILE_OPTION = re.compile(r"exclude|ignore|include|glob|pattern|name|regex|expr|format|color|sort|type")
+WRAPPER_FILE_OPTIONS = {"-a", "--arg-file", "-o", "--output"}
+GIT_VALUE_OPTIONS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path",
+                     "--super-prefix", "--config-env"}
 
 
-PREFIXES = {"sudo", "command", "nohup", "time", "env", "nice", "exec", "builtin", "doas"}
-PREFIX_ARG_FLAGS = {"-u", "-g", "-C", "-p", "-U", "-h", "--user", "--group", "--chdir"}
+def home_text(word: str) -> str:
+    return HOME_VARIABLE.sub(lambda _m: str(Path.home()), word)
 
 
-def bare_path_args(words: List[str]) -> Set[int]:
-    picked: Set[int] = set()
-    for seg in segments(words):
-        name = command_name(words, seg)
-        positional = [i for i in seg[1:] if not words[i].startswith("-") and os.path.basename(words[i]) != name]
-        if name in SEARCH_COMMANDS:
-            picked.update(positional[1:])
-        elif name in FILE_COMMANDS:
-            picked.update(positional)
-    return picked
-
-
-def write_targets(words: List[str]) -> Set[int]:
-    targets: Set[int] = set()
-    for seg in segments(words):
-        name = command_name(words, seg)
-        args = [i for i in seg[1:] if not words[i].startswith("-")]
-        if name in CHANGES_ALL_ARGS or (name == "sed" and any(words[i].startswith("-i") for i in seg)):
-            targets.update(args)
-        elif name in ("cp", "mv") and args:
-            targets.add(args[-1])
-        elif name == "git" and len(args) > 1 and words[args[0]] in GIT_FILE_CHANGERS:
-            targets.update(args[1:])
-        targets.update(i + 1 for i in seg if words[i] in (">", ">>", ">|", "&>") and i + 1 < len(words))
-    return targets
-
-
-def deleted_targets(words: List[str]) -> Set[int]:
-    found: Set[int] = set()
-    for seg in segments(words):
-        name = command_name(words, seg)
-        args = [i for i in seg[1:] if not words[i].startswith("-")]
-        if name in ("rm", "unlink", "shred"):
-            found.update(args)
-        elif name == "git" and len(args) > 1 and words[args[0]] == "rm" and "--cached" not in [words[i] for i in seg]:
-            found.update(args[1:])
-    return found
-
-
-def moved_out_of_tests(words: List[str], root: Path, start: Path, cfg: Config) -> List[str]:
-    """Test files that `mv` / `git mv` would move somewhere that is not a test path."""
-    out: List[str] = []
-    dirs = working_dirs(words, start)
-    for seg in segments(words):
-        name = command_name(words, seg)
-        args = [i for i in seg[1:] if not words[i].startswith("-")]
-        if name == "git" and args and words[args[0]] == "mv":
-            args = args[1:]
-        elif name != "mv":
-            continue
-        if len(args) < 2:
-            continue
-        dest = relative(words[args[-1]], root, dirs[args[-1]])
-        if dest is not None and cfg.tests.match(dest.rstrip("/") + "/x_test.py"):
-            continue  # moved into another test location
-        if dest is not None and cfg.tests.match(dest):
-            continue
-        for i in args[:-1]:
-            rel = relative(words[i], root, dirs[i])
-            if rel is not None and cfg.tests.match(rel):
-                out.append(rel)
-    return out
-
-
-def working_dirs(words: List[str], start: Path) -> List[Path]:
-    dirs: List[Path] = []
-    current, pending, begin = start, None, 0
-    for index, word in enumerate(words):
-        if word in SEPARATORS:
-            if pending is not None:
-                current, pending = pending, None
-            begin = index + 1
-        elif index == begin + 1 and words[begin] in ("cd", "pushd"):
-            target = Path(word).expanduser()
-            pending = (target if target.is_absolute() else current / target).resolve()
-        elif index == begin and word in ("cd", "pushd"):
-            pending = Path.home()
-        dirs.append(current)
-    return dirs
-
-
-def paths_named(words: List[str], root: Path, start: Path, only: Optional[Set[int]] = None) -> List[str]:
-    dirs = working_dirs(words, start)
-    as_path = bare_path_args(words) if only is None else only
-    patterns = {i + 1 for i, w in enumerate(words) if w in FIND_PATTERN_OPTIONS}
+def word_paths(word: str, here: Path, root: Path, as_path: bool) -> List[str]:
+    """Project-relative paths a word may name. Wildcards and braces are expanded."""
+    if not as_path and any(c.isspace() for c in word):
+        return []  # prose (a PR body, a search pattern), not a file name
     found: List[str] = []
-    for index, word in enumerate(words):
-        if (only is not None and index not in only) or index in patterns:
-            continue
-        here = dirs[index] if index < len(dirs) else start
-        for piece in re.split(r"[=:<>|;&(){}]", word):
+    spellings = sh.braces(home_text(word))
+    if "$" in word:  # `.e${nothing}nv`: an unset variable expands to nothing
+        spellings += sh.braces(sh.VARIABLE.sub("", word))
+    for candidate in spellings:
+        for piece in re.split(r"[=:<>|;&(){}]", candidate):
             if not piece or piece.startswith("-"):
                 continue
+            piece = os.path.expanduser(piece)
             if GLOB_CHARS & set(piece) and not any(c.isspace() for c in word):
                 matches = expand(piece if os.path.isabs(piece) else str(here / piece))
-                if not matches and (index in as_path or "/" in piece):
+                if not matches and (as_path or "/" in piece):
                     matches = [piece]  # unmatched wildcard: judge the pattern text itself
-            elif "/" in piece or index in as_path:
+            elif "/" in piece or as_path:
                 matches = [piece]
             else:
                 continue
@@ -488,6 +412,121 @@ def paths_named(words: List[str], root: Path, start: Path, only: Optional[Set[in
     return found
 
 
+def path_args(cmd: sh.Command) -> Set[int]:
+    """Positions in argv that are file names even without a slash (`cat notes`)."""
+    argv = cmd.argv
+    positional = [i for i in range(1, len(argv)) if not argv[i].startswith("-")]
+    if cmd.name in SEARCH_COMMANDS:
+        patterns = {i + 1 for i, w in enumerate(argv) if re.fullmatch(r"-[A-Za-z]*e|--regexp", w)}
+        files = {i + 1 for i, w in enumerate(argv) if re.fullmatch(r"-[A-Za-z]*f|--file", w)}
+        if patterns or files or any(w.startswith(("--regexp=", "--file=")) for w in argv):
+            return set(positional) - patterns  # the pattern came from an option: the rest are files
+        return set(positional[1:])
+    if cmd.name == "jq":
+        return set(positional[1:])  # the first word is the filter, e.g. `.env.NODE_ENV`
+    if cmd.name in FILE_COMMANDS or cmd.name in sh.SHELLS:
+        return set(positional)  # for a shell: the script and its arguments
+    return set()
+
+
+def named(cmd: sh.Command, root: Path) -> List[str]:
+    as_path = path_args(cmd)
+    patterns = {i + 1 for i, w in enumerate(cmd.argv) if w in FIND_PATTERN_OPTIONS}
+    here = Path(cmd.cwd)
+    found: List[str] = []
+    for i, word in enumerate(cmd.argv):
+        if i not in patterns:
+            found += word_paths(word, here, root, i in as_path)
+        option, equals, value = word.partition("=")
+        if (equals and option.startswith("--") and (cmd.name in FILE_COMMANDS or cmd.name in SEARCH_COMMANDS)
+                and not NOT_A_FILE_OPTION.search(option)):
+            found += word_paths(value, here, root, True)  # tar --file=NAME
+    for word in cmd.assigns:
+        found += word_paths(word, here, root, False)
+    for word in cmd.file_redirects():
+        found += word_paths(word, here, root, True)
+    for i, word in enumerate(cmd.wrapper_words):  # xargs -a FILE, time -o FILE
+        option, equals, value = word.partition("=")
+        if i and cmd.wrapper_words[i - 1] in WRAPPER_FILE_OPTIONS:
+            found += word_paths(word, here, root, True)
+        elif equals and option in WRAPPER_FILE_OPTIONS:
+            found += word_paths(value, here, root, True)
+        else:
+            found += word_paths(word, here, root, False)
+    return found
+
+
+def reaches_home_secret(cmd: sh.Command) -> bool:
+    """A credential folder named outright, or reached after `cd ~` (`cd ~ && cat .ssh/id_rsa`)."""
+    as_path = path_args(cmd)
+    home = os.path.realpath(str(Path.home()))
+    words = [(w, i in as_path) for i, w in enumerate(cmd.argv)] + [(w, True) for w in cmd.file_redirects()]
+    for word, is_path in words + [(w, False) for w in cmd.assigns + cmd.wrapper_words]:
+        if names_sensitive_home(word):
+            return True
+        for piece in home_text(word).split("="):
+            if not piece or piece.startswith("-") or not (is_path or "/" in piece):
+                continue
+            full = os.path.join(cmd.cwd, os.path.expanduser(piece))
+            guesses = [full] if cmd.cwd_known else [full, os.path.join(home, piece)]  # `cd $X`: maybe home
+            for match in [*guesses, *(expand(full) if GLOB_CHARS & set(piece) else [])]:
+                real = os.path.realpath(match)
+                for folder in SENSITIVE_HOME:
+                    secret = os.path.join(home, folder)
+                    if real == secret or real.startswith(secret + os.sep):
+                        return True
+    return False
+
+
+def git_words(argv: List[str]) -> List[str]:
+    """A git command from its subcommand on: `git -C "my dir" push -f` -> [push, -f]."""
+    i = 1
+    while i < len(argv) and argv[i].startswith("-"):
+        i += 2 if argv[i] in GIT_VALUE_OPTIONS else 1
+    return argv[i:]
+
+
+def write_targets(cmd: sh.Command) -> List[str]:
+    args = [w for w in cmd.argv[1:] if not w.startswith("-")]
+    targets: List[str] = []
+    in_place = cmd.name == "sed" and any(w.startswith(("-i", "--in-place")) for w in cmd.argv)
+    if cmd.name in CHANGES_ALL_ARGS or in_place:
+        targets += args
+    elif cmd.name == "cp" and args:
+        targets.append(args[-1])
+    elif cmd.name == "git":
+        args = [w for w in git_words(cmd.argv) if not w.startswith("-")]
+        targets += args[1:] if args and args[0] in GIT_FILE_CHANGERS else []
+    return targets + cmd.file_redirects(writes_only=True)
+
+
+def deleted_targets(cmd: sh.Command) -> List[str]:
+    args = [w for w in cmd.argv[1:] if not w.startswith("-")]
+    if cmd.name in ("rm", "unlink", "shred"):
+        return args
+    args = [w for w in git_words(cmd.argv) if not w.startswith("-")] if cmd.name == "git" else []
+    if len(args) > 1 and args[0] == "rm" and "--cached" not in cmd.argv:
+        return args[1:]
+    return []
+
+
+def moved_out_of_tests(cmd: sh.Command, root: Path, cfg: Config) -> List[str]:
+    """Test files that `mv` / `git mv` would move somewhere that is not a test path."""
+    args = [w for w in (git_words(cmd.argv) if cmd.name == "git" else cmd.argv[1:]) if not w.startswith("-")]
+    if cmd.name == "git" and args and args[0] == "mv":
+        args = args[1:]
+    elif cmd.name != "mv":
+        return []
+    if len(args) < 2:
+        return []
+    here = Path(cmd.cwd)
+    dest = relative(args[-1], root, here)
+    if dest is not None and (cfg.tests.match(dest.rstrip("/") + "/x_test.py") or cfg.tests.match(dest)):
+        return []  # moved into another test location
+    rels = [relative(w, root, here) for w in args[:-1]]
+    return [rel for rel in rels if rel is not None and cfg.tests.match(rel)]
+
+
 def pattern_hits(pattern: str, rules: Rules) -> bool:
     """Could this wildcard pattern match an off-limits path? Tries a few concrete stand-ins."""
     text = pattern.replace("**/", "").lstrip("/")
@@ -496,37 +535,41 @@ def pattern_hits(pattern: str, rules: Rules) -> bool:
     return any(s and rules.match(s) for s in samples)
 
 
-def check_find_patterns(words: List[str], cfg: Config) -> None:
-    for i, w in enumerate(words[:-1]):
-        if w in FIND_PATTERN_OPTIONS and pattern_hits(words[i + 1], cfg.off_limits):
-            block(f"this find targets an off-limits path ({words[i + 1]}).")
+def check_find_patterns(cmd: sh.Command, cfg: Config, root: Path) -> None:
+    """`find -name PATTERN`: refuse a pattern that fits an off-limits name, real or likely."""
+    try:
+        present = os.listdir(cmd.cwd)
+    except OSError:
+        present = []
+    for i, w in enumerate(cmd.argv[:-1]):
+        if w not in FIND_PATTERN_OPTIONS:
+            continue
+        value = cmd.argv[i + 1]
+        real = [relative(name, root, Path(cmd.cwd)) for name in fnmatch.filter(present, os.path.basename(value))]
+        if pattern_hits(value, cfg.off_limits) or any(rel and cfg.off_limits.match(rel) for rel in real):
+            block(f"this find targets an off-limits path ({value}).")
 
 
-def check_rm_rf(words: List[str], root: Path, start: Path) -> None:
-    dirs = working_dirs(words, start)
-    for seg in segments(words):
-        if command_name(words, seg) != "rm":
-            continue
-        flags = "".join(words[i].lstrip("-") for i in seg if words[i].startswith("-"))
-        long_flags = {words[i] for i in seg if words[i].startswith("--")}
-        recursive = "r" in flags.lower() or "--recursive" in long_flags
-        if not recursive:
-            continue
-        for i in seg[1:]:
-            w = words[i]
-            if w.startswith("-"):
-                continue
-            inside_sub = dirs[i] != root and is_within(dirs[i], root)
-            if w in ("/", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "..", "../", ".", "./") or (
-                w == "*" and not inside_sub
-            ):
+def check_rm_rf(cmd: sh.Command, root: Path) -> None:
+    if cmd.name != "rm":
+        return
+    flags = [w for w in cmd.argv[1:] if w.startswith("-")]
+    long_form = [w for w in flags if w.startswith("--r") and "--recursive".startswith(w)]
+    if not long_form and not any(not w.startswith("--") and "r" in w.lower() for w in flags):
+        return
+    here = Path(cmd.cwd)
+    inside_sub = cmd.cwd_known and here != root and is_within(here, root)
+    for word in cmd.argv[1:]:
+        for w in ([] if word.startswith("-") else sh.braces(word)):
+            if w in RM_ROOTS or (w == "*" and not inside_sub):
                 block(f"`rm -r {w}` would delete far more than intended. Name the exact paths.")
             if w == "*":
                 continue
-            here = str(dirs[i])
-            w = re.sub(r"\$\{?PWD\}?", lambda _m, h=here: h, w)
-            target = Path(os.path.expandvars(w)).expanduser()
-            target = (target if target.is_absolute() else dirs[i] / target).resolve()
+            text = home_text(re.sub(r"\$\{?PWD\}?", lambda _m: str(here), w))
+            while text.endswith("/*") or (text.endswith("/") and len(text) > 1):
+                text = text[:-2] if text.endswith("/*") else text[:-1]  # `dir/*` empties dir
+            target = Path(os.path.expandvars(text or "/")).expanduser()
+            target = (target if target.is_absolute() else here / target).resolve()
             if target in (Path.home(), Path("/")) or is_within(root, target):
                 block(f"`rm -r {w}` would delete the project or a folder that contains it.")
 
@@ -539,15 +582,39 @@ def is_within(path: Path, parent: Path) -> bool:
         return False
 
 
-def check_git(command: str, cfg: Config) -> Set[str]:
+def without_message(argv: List[str]) -> List[str]:
+    """A git command minus its message text: a commit message may mention .env or `rm -rf`."""
+    if not MESSAGE_COMMANDS & set(argv):
+        return argv
+    out: List[str] = []
+    skip = False
+    for word in argv:
+        if skip:
+            skip = False
+        elif word == "--message" or re.fullmatch(r"-[a-zA-Z]*m", word):
+            out.append(word)
+            skip = True
+        elif word.startswith("--message=") or re.fullmatch(r"-m.+", word):
+            out.append("-m")
+        else:
+            out.append(word)
+    return out
+
+
+def check_git(cmds: List[sh.Command], root: Path, cfg: Config) -> None:
     """Check each git invocation on its own words, so `git push && rm -f x` is not a force push."""
-    words = split_words(command)
     subs: Set[str] = set()
-    for seg in segments(words):
-        if command_name(words, seg) == "git":
-            text = " ".join(shlex.quote(words[i]) for i in seg)
+    texts: List[str] = []
+    for cmd in cmds:
+        if cmd.name == "git":
+            text = " ".join(shlex.quote(w) for w in ["git", *git_words(cmd.argv)])
+            options = " ".join(cmd.argv[1:len(cmd.argv) - len(git_words(cmd.argv))])
+            if cfg.flags["block_no_verify"] and re.search(r"core\.hooksPath", options, re.IGNORECASE):
+                block("overriding core.hooksPath switches off the repo's own git hooks. Fix what they report instead.")
             subs |= check_git_segment(text, cfg)
-    return subs
+            texts.append(text)
+    if "commit" in subs:
+        check_commit(root, commit_scope(" ; ".join(texts), subs), cfg)
 
 
 def check_git_segment(command: str, cfg: Config) -> Set[str]:
@@ -561,16 +628,16 @@ def check_git_segment(command: str, cfg: Config) -> Set[str]:
     force = r"(?<!\S)(?:--force\S*|-\w*f\w*|\+\S+)(?!\S)"
     if cfg.flags["block_force_push"] and "push" in subs and re.search(force, command):
         block("forced pushes are not allowed. If one is really needed, the user runs it by hand.")
-    if cfg.flags["block_no_verify"] and re.search(r"(?<!\S)--no-verify(?!\S)", command) or (
-        cfg.flags["block_no_verify"] and "commit" in subs and re.search(r"\bcommit\b.*(?<!\S)-\w*n\w*(?!\S)", command)
+    if cfg.flags["block_no_verify"] and re.search(r"(?<!\S)--no-veri\w*(?!\S)", command) or (
+        cfg.flags["block_no_verify"] and "commit" in subs and re.search(r"\bcommit\b.*(?<!\S)-(?!u)\w*n\w*(?!\S)", command)
     ):
         block("--no-verify skips the repo's own checks. Fix what the hooks report instead.")
     if cfg.flags["block_destructive_git"]:
-        if "reset" in subs and re.search(r"\breset\b.*--hard\b", command):
+        if "reset" in subs and re.search(r"\breset\b.*--ha\w*", command):
             block("`git reset --hard` throws away uncommitted work. Use `git stash` or ask the user.")
-        if "clean" in subs and re.search(r"\bclean\b.*(?<!\S)-\w*f", command):
+        if "clean" in subs and re.search(r"\bclean\b.*(?<!\S)(?:-\w*f|--f\w*)", command):
             block("`git clean -f` deletes untracked files for good. Ask the user first.")
-        if subs & {"checkout", "restore"} and re.search(r"\b(checkout|restore)\b(\s+--\S*)*\s+(--\s+)?\.(\s|$)", command):
+        if subs & {"checkout", "restore"} and re.search(r"\b(checkout|restore)\b(\s+-\S+)*\s+(--\s+)?\.(\s|$)", command):
             block("this discards every uncommitted change in the repo. Name specific files.")
     return subs
 
@@ -627,74 +694,67 @@ def check_commit(root: Path, scope: str, cfg: Config) -> None:
                   "variable. If it is a false alarm, the user can commit by hand.")
 
 
-HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\s*(?=\n|$)", re.DOTALL)
-SUBSHELL = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
-SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
-ENV_DUMP = {"printenv", "env", "export", "set", "declare"}
+def check_env_dump(cmd: sh.Command) -> None:
+    name, rest = cmd.name, cmd.argv[1:]
+    if cmd.derived:
+        dumps = name == "printenv" and not rest  # `go env`, `npm pkg set` are not the shell built-ins
+    else:
+        dumps = name == "env" or (name in ("set", "printenv") and not rest) or (
+            name in ("export", "declare", "typeset") and all(w.startswith("-") for w in rest))
+    if dumps:
+        block(f"`{name}` prints every environment variable, secrets included, into the transcript. "
+              "Print the one variable you need, e.g. `echo $NODE_ENV`.")
 
 
-def nested_commands(words: List[str]) -> List[str]:
-    """Command strings run by `bash -c '...'`, `eval ...` and `$(...)`, checked like the outer one."""
-    found: List[str] = []
-    for seg in segments(words):
-        name = command_name(words, seg)
-        idx = list(seg)
-        if name in SHELLS:
-            for j, i in enumerate(idx):
-                if words[i] in ("-c", "-lc", "-ic") and j + 1 < len(idx):
-                    found.append(words[idx[j + 1]])
-        elif name == "eval":
-            found.append(" ".join(words[i] for i in idx[1:]))
-    return found
-
-
-def check_env_dump(words: List[str]) -> None:
-    for seg in segments(words):
-        name = command_name(words, seg)
-        first = os.path.basename(words[seg[0]])
-        rest = [words[i] for i in seg[1:]]
-        bare_env = first == "env" and name == ""  # `env` or `env FOO=bar` with no program
-        if name == "printenv" or bare_env or (
-            name in ("export", "set", "declare") and all(w.startswith("-") for w in rest)
-        ):
-            name = name or "env"
-            block(f"`{name}` prints every environment variable, secrets included, into the transcript. "
-                  "Print the one variable you need, e.g. `echo $NODE_ENV`.")
-
-
-def check_bash(command: str, root: Path, start: Path, cfg: Config, depth: int = 0) -> None:
-    command = HEREDOC.sub(" ", command)  # heredoc text is data (a README), not paths to read
-    command = MESSAGE_ARG.sub(" ", command)  # a commit message may mention .env
-    if depth < 3:
-        for inner in [a or b for a, b in SUBSHELL.findall(command)]:
-            check_bash(inner, root, start, cfg, depth + 1)
-        for inner in nested_commands(split_words(command)):
-            check_bash(inner, root, start, cfg, depth + 1)
-    if names_sensitive_home(command):
-        block("this command reaches into a credential folder in your home directory.")
-    words = split_words(command)
-    check_find_patterns(words, cfg)
-    if cfg.flags["block_env_dump"]:
-        check_env_dump(words)
-    named = paths_named(words, root, start)
-    off = sorted({rel for rel in named if cfg.off_limits.match(rel)})
+def check_commands(cmds: List[sh.Command], root: Path, cfg: Config) -> None:
+    for cmd in cmds:
+        if reaches_home_secret(cmd):
+            block("this command reaches into a credential folder in your home directory.")
+        check_find_patterns(cmd, cfg, root)
+        if cfg.flags["block_env_dump"]:
+            check_env_dump(cmd)
+    off = sorted({rel for cmd in cmds for rel in named(cmd, root) if cfg.off_limits.match(rel)})
     if off:
         block(f"this command touches {', '.join(off[:3])}, which is off limits (guard.json).")
-    if cfg.flags["block_rm_rf_roots"]:
-        check_rm_rf(words, root, start)
-    written = paths_named(words, root, start, only=write_targets(words))
-    for rel in sorted(set(written)):
+    written: Set[str] = set()
+    deleted: Set[str] = set()
+    for cmd in cmds:
+        here = Path(cmd.cwd)
+        if cfg.flags["block_rm_rf_roots"]:
+            check_rm_rf(cmd, root)
+        for word in write_targets(cmd):
+            written.update(word_paths(word, here, root, True))
+        for word in deleted_targets(cmd):
+            deleted.update(rel for rel in word_paths(word, here, root, True) if cfg.tests.match(rel))
+        deleted.update(moved_out_of_tests(cmd, root, cfg))
+    for rel in sorted(written):
         problem = write_problem(rel, root, cfg)
         if problem:
             block(problem)
-    if cfg.flags["protect_tests"]:
-        deleted = paths_named(words, root, start, only=deleted_targets(words))
-        tests = sorted({rel for rel in deleted if cfg.tests.match(rel)} | set(moved_out_of_tests(words, root, start, cfg)))
-        if tests:
-            block(f"this deletes test files ({', '.join(tests[:3])}). Ask the user before removing tests.")
-    subs = check_git(command, cfg)
-    if "commit" in subs:
-        check_commit(root, commit_scope(command, subs), cfg)
+    if cfg.flags["protect_tests"] and deleted:
+        block(f"this deletes test files ({', '.join(sorted(deleted)[:3])}). Ask the user before removing tests.")
+    check_git(cmds, root, cfg)
+
+
+def check_bash(command: str, root: Path, start: Path, cfg: Config, depth: int = 0,
+               variables: Optional[Dict[str, str]] = None, budget: Optional[List[int]] = None) -> None:
+    budget = [MAX_STRINGS] if budget is None else budget
+    budget[0] -= 1
+    if depth > MAX_DEPTH or budget[0] < 0:
+        block("this command nests more shells than the guard will follow. Run the inner command directly.")
+    cmds, strings, unbalanced = sh.parse(command, str(start), variables, PLAIN, SENSITIVE)
+    for cmd in cmds:
+        if cmd.name == "git":
+            cmd.argv = without_message(cmd.argv)
+    check_commands(cmds, root, cfg)
+    for text, where, known in strings:
+        check_bash(text, root, Path(where), cfg, depth + 1, known, budget)
+    if unbalanced:  # quotes do not pair up, so the reading above may be wrong: read it again without them
+        check_bash(re.sub(r"[\"'`]", " ", command), root, start, cfg, depth + 1, variables, budget)
+
+
+def timed_out(*_args: Any) -> None:
+    raise TimeoutError("the guard took too long to read this command")
 
 
 def main() -> None:
@@ -719,7 +779,16 @@ def main() -> None:
     elif tool == "Bash":
         cwd = event.get("cwd")
         start = Path(cwd) if isinstance(cwd, str) and os.path.isdir(cwd) else root
-        check_bash(str(tool_input.get("command", "")), root, start.resolve(), cfg)
+        try:
+            if hasattr(signal, "SIGALRM"):  # a command built to stall the guard must not outlast the hook timeout
+                signal.signal(signal.SIGALRM, timed_out)
+                signal.alarm(MAX_SECONDS)
+            check_bash(str(tool_input.get("command", "")), root, start.resolve(), cfg)
+        except Exception as exc:  # noqa: BLE001 - an unreadable command must not slip through unchecked
+            block(f"could not read this command ({type(exc).__name__}). Simplify it, or ask the user to run it.")
+        finally:
+            if hasattr(signal, "SIGALRM"):
+                signal.alarm(0)
 
 
 if __name__ == "__main__":

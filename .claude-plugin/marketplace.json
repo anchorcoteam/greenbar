@@ -6,7 +6,7 @@
     {
       "name": "greenbar",
       "source": "./plugins/greenbar",
-      "description": "Claude can't finish a turn while your tests or lint fail, and can't read secrets, weaken tests or force-push. 195-case test suite."
+      "description": "Claude can't finish a turn while your tests or lint fail, and can't read secrets, weaken tests or force-push. 562-case test suite."
     }
   ]
 }

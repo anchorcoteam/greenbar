@@ -1,6 +1,6 @@
 {
   "name": "greenbar",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Hooks for Claude Code: a Stop-time done gate that runs your real checks, plus guard rails for secrets, tests and destructive git.",
   "author": { "name": "anchorcoteam" },
   "homepage": "https://github.com/anchorcoteam/greenbar",

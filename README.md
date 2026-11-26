@@ -11,7 +11,7 @@ It also adds a guard that runs before every tool call and blocks the usual ways 
 reading `.env` files and keys, skipping or deleting tests, force-pushing, `--no-verify`, `git reset --hard`,
 `rm -rf` on the wrong folder, and committing a secret.
 
-Free and open source (MIT). Python 3.9+, standard library only, no network calls. 195 test cases.
+Free and open source (MIT). Python 3.9+, standard library only, no network calls. 562 test cases.
 
 > greenbar is an independent project. It is not made, endorsed or supported by Anthropic.
 
@@ -75,14 +75,25 @@ It is on as soon as the plugin is installed. Defaults, all configurable in `.cla
 
 | Blocks | Examples caught |
 |---|---|
-| Off-limits paths (`.env`, `.env.*` except `*.example`/`*.sample`/`*.template`, `*.pem`, `*.key`, `id_rsa*`, `secrets/`) | `Read .env`, `cat ./.ENV`, `head -c 200 .e*`, `cd src && cat ../.env`, `source .env`, `bash -c 'cat .env'`, `eval`, `$(cat .env)`, `Glob **/.env`, `find . -name '.env*'` |
+| Off-limits paths (`.env`, `.env.*` except `*.example`/`*.sample`/`*.template`, `*.pem`, `*.key`, `id_rsa*`, `secrets/`) | `Read .env`, `cat ./.ENV`, `head -c 200 .e*`, `cd src && cat ../.env`, `source .env`, `timeout 30 cat .env`, `bash -c 'cat .env'`, `echo .env \| xargs cat`, `eval`, `$(cat .env)`, `Glob **/.env`, `find . -name '.env*'` |
 | Dumping the environment into the transcript | `printenv`, bare `env`, `export -p`, `set` |
 | Credential folders in your home directory | `~/.ssh`, `~/.aws`, `~/.gnupg`, `~/.kube`, `~/.docker`, `~/.netrc` |
 | Weakening tests | adding `@pytest.mark.skip`, `@unittest.skip`, `it.skip(`, `xit(`, `t.Skip()`, `#[ignore]`; edits that remove test functions; `rm`/`git rm` of test files, or moving them out of a test folder (snapshots and caches are exempt) |
 | Read-only and locked files | `read_only` globs; `locked_once_committed` globs (for example applied migrations: new files are fine, committed ones can't change) |
 | Destructive git | `push --force` / `-f` / `+branch` / `--force-with-lease`, `--no-verify`, `commit -n`, `-c core.hooksPath=…`, `reset --hard`, `clean -f`, `checkout -- .`, `restore .` |
-| Deleting far too much | `rm -rf /`, `~`, `$HOME`, `$PWD`, `..`, `.`, `*` at the project root, or the project root itself |
+| Deleting far too much | `rm -rf /`, `~`, `$HOME`, `$PWD`, `..`, `.`, `*` at the project root, or the project root itself, also as `sudo rm -rf /`, `timeout 30 rm -rf ~` or `find . -exec rm -rf ~ \;` |
 | Committing secrets | never-commit files staged, or added lines that look like AWS/GitHub/Stripe/Slack/Google/Anthropic/OpenAI keys, private keys or quoted passwords |
+
+**How shell commands are read.** The guard does not match the command line against a list of bad
+strings. It splits it the way a shell would (quotes, escapes, `;`, `&&`, pipes, subshells, loop bodies,
+here-documents) and checks each command that would really run. Wrapper commands are stripped first
+(`sudo`, `env`, `timeout`, `nice`, `nohup`, `time`, `command`, `exec`, `stdbuf`, `xargs`, `watch` and
+others), so `timeout 30 cat .env` and `/bin/cat ".env"` are both judged as `cat .env`. It follows command
+text into `sh -c '...'`, `eval`, `$(...)`, backticks, `find -exec` and text piped or here-doc'd into a
+shell, and it fills in a variable set to plain text earlier on the same line (`f=.env; cat $f`). When a
+program it does not know has a command such as `cat` or `rm` among its arguments, that is checked as a
+command too, so it errs toward blocking: `docker exec app cat .env` is refused. If it cannot read a
+command at all, it blocks it.
 
 In a trusted `guard.json`, a list you set replaces that list's defaults. See `plugins/greenbar/examples/`
 for both config files. If `guard.json` is broken, the guard uses its defaults and still lets Claude edit
@@ -106,10 +117,29 @@ set it up. greenbar writes nothing else.
 
 ## What it does not do
 
-- **It is not a sandbox.** The guard reads command text. A determined process can still reach a file
-  in ways it cannot see: a script or `python -c` that opens `.env` itself, recursive search such as
-  `grep -r KEY .` (which reads every file), `cat $(echo .env)`, encoded paths, or symlinks made at run
-  time. Use it as a guard rail, and keep real secrets out of reach with OS permissions.
+- **The guard is a seatbelt, not a sandbox.** It reads the text of a command before it runs; it does
+  not watch or confine the process. It stops the accidents and the lazy shortcuts, and anything that
+  hides what it does from the command text gets past it. Known gaps:
+  - Another language doing the work: `python -c "open('.env').read()"`, `node -e`, a script file, a
+    Makefile target or an npm script.
+  - Text that only exists at run time: `cat $(echo .env)`, a variable set in an earlier command or
+    exported by your shell, a program name built on the fly (`$CMD .env`), a file list fed to `xargs`
+    or `sh` from a file or the network (`curl ... | sh`).
+  - Aliases and shell functions defined elsewhere, and git aliases.
+  - Commands that read everything under a folder: `grep -r KEY .`, `tar c .`, `cp -r . /tmp/x`.
+  - Command strings sent somewhere else to run, such as `ssh host '...'`.
+  - A program the guard does not know as a file reader, given a bare file name (`curl -d @.env ...`,
+    `git show HEAD:.env`). A path with a slash is always checked, whatever the program.
+  - A program that runs code written inside its own arguments: `awk 'BEGIN{system("...")}'`,
+    `git -c alias.x='!...' x`, `some-tool --cmd='...'`.
+  - `find . -exec cat {} +` with no name filter, which reads every file it finds.
+  - Emptying a test file from the shell (`: > tests/test_x.py`); the test rules cover the edit tools,
+    `rm`, `git rm` and `mv`.
+  - `env` run inside something else (`docker exec app env`), because `go env` and `conda env` must work.
+  - Encoded or computed spellings (`.e{n..n}v`, `/bin/ca? .env`), and symlinks made at run time.
+
+  Keep real secrets out of reach with OS permissions, and use a real sandbox or container when the
+  agent must not be able to do something.
 - Checks inherit your environment, so a test that prints environment variables can show them to Claude.
   Output is redacted for common key formats, not for everything.
 - `cp .env.example .env` is blocked because it writes an off-limits file. Run it yourself.
@@ -126,7 +156,7 @@ set it up. greenbar writes nothing else.
 ## Test it
 
 ```bash
-python3 tests/run_tests.py        # 195 cases, about 1-2 minutes, touches only a temp folder
+python3 tests/run_tests.py        # 562 cases, a few minutes, touches only a temp folder
 python3 tests/run_tests.py -v     # list every case
 ```
 
