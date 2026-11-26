@@ -13,6 +13,7 @@ SOURCE="${SOURCE:?set SOURCE to a git URL or path of the greenbar repo}"
 : "${CLAUDE_CODE_OAUTH_TOKEN:?set CLAUDE_CODE_OAUTH_TOKEN (claude setup-token)}"
 CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude)}"
 SAMPLE_REPO="${SAMPLE_REPO:-https://github.com/hukkin/tomli}"
+MARKETPLACE="${MARKETPLACE:-}"   # e.g. anchorcoteam/greenbar; default: the clone made in step 1
 WORK="$(mktemp -d)"
 export HOME="$WORK/home"
 mkdir -p "$HOME"
@@ -35,9 +36,11 @@ step "2. greenbar's own test suite"
 python3 "$WORK/greenbar/tests/run_tests.py" | tail -1
 
 step "3. install as a plugin into the fresh HOME"
-"$CLAUDE_BIN" plugin marketplace add "$WORK/greenbar"
+"$CLAUDE_BIN" plugin marketplace add "${MARKETPLACE:-$WORK/greenbar}"
 "$CLAUDE_BIN" plugin install greenbar@greenbar
-"$CLAUDE_BIN" plugin list 2>&1 | grep -A2 greenbar || true
+"$CLAUDE_BIN" plugin list 2>&1 | grep -A4 greenbar || true
+GATE="$(find "$HOME/.claude/plugins" "$WORK/greenbar" -path '*greenbar/hooks/done_gate.py' 2>/dev/null | head -1)"
+echo "installed done gate: ${GATE/#$HOME/~}"
 
 step "4. fresh clone of a small public repo, with its tests green"
 git clone -q --depth 1 "$SAMPLE_REPO" "$WORK/sample"
@@ -45,7 +48,7 @@ cd "$WORK/sample"
 PYTHONPATH=src python3 -m unittest -q 2>&1 | tail -1
 mkdir -p .claude
 printf '{"checks":[{"name":"tests","run":"PYTHONPATH=src python3 -m unittest -q"}]}\n' > .claude/done-gate.json
-python3 "$WORK/greenbar/plugins/greenbar/hooks/done_gate.py" trust "$PWD"
+python3 "$GATE" trust "$PWD"
 printf '.claude/\n' >> .git/info/exclude
 printf 'API_KEY=fake-value-for-the-break-test\n' > .env
 printf '.env\n' >> .git/info/exclude

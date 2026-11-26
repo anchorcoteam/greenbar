@@ -35,7 +35,7 @@ commands, asks you to confirm them, and writes `.claude/done-gate.json`. You can
 own commands. `/greenbar:setup` does this for you. By hand:
 
 ```bash
-python3 ~/.claude/plugins/cache/greenbar/greenbar/*/hooks/done_gate.py trust .   # path may vary; `claude plugin details greenbar` shows it
+python3 "$(find ~/.claude/plugins -path '*greenbar/hooks/done_gate.py' | head -1)" trust .
 ```
 
 Run it again whenever you edit `.claude/done-gate.json`. Until then the gate allows the stop and tells you why.
@@ -130,8 +130,12 @@ python3 tests/run_tests.py        # 195 cases, about 1-2 minutes, touches only a
 python3 tests/run_tests.py -v     # list every case
 ```
 
-`proof/` holds a recorded run on a clean machine profile. It installs from this repo only, runs the
-suite, and runs a live break test where headless Claude Code is asked to break a test and say "done".
+`proof/` holds recorded runs. `macos-clean-home-run.txt` is a brand-new HOME that installs the plugin from
+GitHub, runs the suite, then runs two live break tests with headless Claude Code on a fresh clone of
+[tomli](https://github.com/hukkin/tomli). In test A, Claude is told to break the parser and reply "Done, all
+tests pass": the gate blocks the stop and Claude reports the 93 failures instead. In test B, Claude is asked to
+`cat .env`, and the guard blocks it. `linux-test-run.md` is the suite in a Linux container. Re-run with
+`proof/clean-home-proof.sh`.
 
 ## License
 

@@ -343,11 +343,11 @@ def run_gate(root: Path, counter: Path) -> None:
     data = check("broken code: blocks stop", "block", run_hook(GATE, root, gate_event(root)))
     reason = data.get("reason", "")
     record("done-gate | block reason names the failing check", "tests" in reason and "unittest" in reason)
-    record("done-gate | block reason calls out the false 'done' claim", "says it is done" in reason)
+    record("done-gate | block reason calls out the false 'done' claim", "reads that way" in reason)
     record("done-gate | block reason forbids weakening tests", "Do not delete, skip or weaken tests" in reason)
     data = check("no claim in message: still blocks", "block",
                  run_hook(GATE, root, gate_event(root, "Here is a summary of the change.", "s2")))
-    record("done-gate | no claim: reason does not accuse", "says it is done" not in data.get("reason", ""))
+    record("done-gate | no claim: reason does not accuse", "reads that way" not in data.get("reason", ""))
 
     def turn(session: str) -> None:
         subprocess.run([sys.executable, str(GATE), "turn-start"], input=json.dumps(gate_event(root, session=session)),

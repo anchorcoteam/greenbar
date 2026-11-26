@@ -323,7 +323,7 @@ class State:
 def block_reason(failures: List[Tuple[str, str, str]], claimed: bool, attempt: int, cap: int) -> str:
     head = "greenbar: the work is not finished. "
     if claimed:
-        head += "Your last message says it is done or passing, but these checks fail:\n"
+        head += "Do not report this as done or passing. Your last message reads that way, but these checks fail:\n"
     else:
         head += "These checks fail:\n"
     parts = [head]
