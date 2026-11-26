@@ -25,6 +25,7 @@ GUARD = HOOKS / "guard.py"
 GATE = HOOKS / "done_gate.py"
 VERBOSE = "-v" in sys.argv
 RESULTS: List[Tuple[str, bool, str]] = []
+XDG = Path(tempfile.mkdtemp(prefix="greenbar-xdg-"))  # trust store for the tests, never the real one
 
 
 def sh(cwd: Path, *args: str) -> None:
@@ -64,7 +65,8 @@ def make_repo(root: Path) -> None:
 
 
 def run_hook(hook: Path, root: Path, event: Dict[str, Any], env: Dict[str, str] = None) -> subprocess.CompletedProcess:
-    full_env = {**os.environ, "CLAUDE_PROJECT_DIR": str(root), "PYTHONDONTWRITEBYTECODE": "1", **(env or {})}
+    full_env = {**os.environ, "CLAUDE_PROJECT_DIR": str(root), "PYTHONDONTWRITEBYTECODE": "1",
+                "XDG_CONFIG_HOME": str(XDG), **(env or {})}
     full_env.pop("DONE_GATE_OFF", None) if not (env or {}).get("DONE_GATE_OFF") else None
     full_env.pop("DONE_GATE_RUNNING", None)
     return subprocess.run([sys.executable, str(hook)], input=json.dumps(event), text=True,
@@ -116,6 +118,9 @@ def guard_cases(root: Path) -> List[Tuple[str, str, Dict[str, Any], str]]:
         ("Add test.skip in JS", ("Edit", {"file_path": str(root / "web/button.test.js"), "old_string": "test('renders'", "new_string": "test.skip('renders'"}), B),
         ("Write test file with xit", ("Write", {"file_path": str(root / "web/button.test.js"), "content": "xit('renders', () => {})\n"}), B),
         ("Add a new assertion to a test", ("Edit", {"file_path": str(root / "tests/test_app.py"), "old_string": "3)", "new_string": "3)\n        self.assertEqual(add(2, 2), 4)"}), A),
+        ("Edit removes a test function", ("Edit", {"file_path": str(root / "tests/test_app.py"), "old_string": "    def test_add(self):\n        self.assertEqual(add(1, 2), 3)\n", "new_string": ""}), B),
+        ("Write empties a test file", ("Write", {"file_path": str(root / "tests/test_app.py"), "content": "import unittest\n"}), B),
+        ("Rename a test (count unchanged)", ("Edit", {"file_path": str(root / "tests/test_app.py"), "old_string": "def test_add(self):", "new_string": "def test_add_two_ints(self):"}), A),
         ("Remove an existing skip", ("Edit", {"file_path": str(root / "tests/test_app.py"), "old_string": "@unittest.skip('x')\n", "new_string": ""}), A),
         ("Write src file mentioning test.skip", ("Write", {"file_path": str(root / "src/notes.py"), "content": "# test.skip( is a JS thing\n"}), A),
         # shell: off-limits paths
@@ -126,6 +131,8 @@ def guard_cases(root: Path) -> List[Tuple[str, str, Dict[str, Any], str]]:
         bash_case("base64 certs/server.pem", B), bash_case("find . -name '.env*'", B),
         bash_case("source .env && npm start", B), bash_case("cat " + home + "/.aws/credentials", B),
         bash_case("cat ~/.ssh/id_ed25519", B), bash_case("ls -la ~/.ssh", B),
+        bash_case("sudo cat .env", B), bash_case("env cat .env", B),
+        bash_case("git -c core.hooksPath=/dev/null commit -m x", B),
         bash_case("cat .env.example", A), bash_case("ls -la", A), bash_case("ls src", A),
         bash_case("grep -rn env src/", A), bash_case("cat README.md", A),
         bash_case("python3 -m unittest discover -s tests", A), bash_case("npm test -- --grep env", A),
@@ -154,6 +161,25 @@ def guard_cases(root: Path) -> List[Tuple[str, str, Dict[str, Any], str]]:
         bash_case("git diff --no-index /dev/null .env", B), bash_case("git diff --output=x.txt", B),
         bash_case("git status --short", A), bash_case("git log --oneline -5", A),
         bash_case("git commit -m 'fix .env handling docs'", A),
+        # reviewer regressions: flags belong to the git segment only
+        bash_case("git push origin main && rm -f x.txt", A), bash_case("git push origin main; ls -f", A),
+        bash_case("git commit -m x && head -n 3 README.md", A), bash_case("git clean -n && rm -f out.txt", A),
+        bash_case("git reset --soft HEAD~1 && ls -la", A), bash_case("git status && git push --force", B),
+        # moves and caches are not deleting tests
+        bash_case("mkdir -p tests/unit && mv tests/test_app.py tests/unit/test_app.py", A),
+        bash_case("git rm --cached tests/test_app.py", A), bash_case("rm -rf tests/__snapshots__", A),
+        bash_case("rm -rf tests/__pycache__", A),
+        # example env files, heredocs, subfolders
+        bash_case("cat .env.development.example", A),
+        bash_case("cat > README.md <<'EOF'\nCopy .env.example to .env and fill it in.\nEOF", A),
+        bash_case("cd build && rm -rf *", A), bash_case("rm -rf $PWD", B),
+        # nested shells and env dumps
+        bash_case("bash -c 'cat .env'", B), bash_case("sh -c \"head .env.local\"", B),
+        bash_case("eval cat .env", B), bash_case("echo $(cat .env)", B), bash_case("printenv", B),
+        bash_case("env", B), bash_case("export -p", B), bash_case("env NODE_ENV=test npm test", A),
+        bash_case("echo $NODE_ENV", A),
+        bash_case("env FOO=bar cat .env", B), bash_case("env bash -c 'cat .env'", B),
+        bash_case("env git push -f", B), bash_case("env FOO=bar", B), bash_case("sudo -u root cat .env", B),
     ]
     out = []
     for label, (tool, tool_input), expected in cases:
@@ -203,28 +229,43 @@ def run_guard_commits(root: Path) -> None:
     attempt("staged .key file", stage("deploy.key", "x\n"), "block")
     attempt("secret in untracked file with git add -A", lambda: (root / "src/config.py").write_text(f"K = '{fake_aws}'\n"),
             "block", "git add -A && git commit -m all")
+    attempt("ML tokenizer name is not a secret", stage("src/config.py", "tokenizer_name = 'bert-base-uncased-v2'\n"), "allow")
     attempt("password read from env (fine)", stage("src/config.py", "password = os.environ['DB_PASSWORD']\n"), "allow")
 
 
 def run_guard_misc(root: Path) -> None:
+    def read(rel: str) -> int:
+        return run_hook(GUARD, root, {"tool_name": "Read", "tool_input": {"file_path": str(root / rel)}}).returncode
+
     res = run_hook(GUARD, root, {"bad": "input"})
-    record("guard | malformed input fails closed", res.returncode == 2, res.stderr[:200])
+    record("guard | malformed input: non-blocking warning, never bricks tools", res.returncode == 1, res.stderr[:200])
     off = root / ".claude" / "guard.off"
     off.write_text("")
-    res = run_hook(GUARD, root, {"tool_name": "Read", "tool_input": {"file_path": str(root / ".env")}})
-    record("guard | guard.off kill switch allows", res.returncode == 0, res.stderr[:200])
+    record("guard | guard.off shipped by an untrusted repo is ignored", read(".env") == 2)
+    trust(root)
+    record("guard | guard.off after the user trusts it: allows", read(".env") == 0)
+    off.unlink()
+    trust(root)
+    off.write_text("")
+    record("guard | guard.off re-created after trust is ignored again", read(".env") == 2)
     off.unlink()
     cfg = root / ".claude" / "guard.json"
     saved = cfg.read_text()
     cfg.write_text("{not json")
-    res = run_hook(GUARD, root, {"tool_name": "Read", "tool_input": {"file_path": str(root / "README.md")}})
-    record("guard | broken guard.json fails closed", res.returncode == 2, res.stderr[:200])
-    cfg.write_text(json.dumps({"off_limits": ["docs/private/**"]}))
-    res = run_hook(GUARD, root, {"tool_name": "Read", "tool_input": {"file_path": str(root / "docs/private/plan.md")}})
-    record("guard | custom off_limits pattern blocks", res.returncode == 2, res.stderr[:200])
-    res = run_hook(GUARD, root, {"tool_name": "Read", "tool_input": {"file_path": str(root / ".env")}})
-    record("guard | custom off_limits replaces defaults (documented)", res.returncode == 0, res.stderr[:200])
+    record("guard | broken guard.json: defaults still protect .env", read(".env") == 2)
+    record("guard | broken guard.json: normal reads still work", read("README.md") == 0)
+    res = run_hook(GUARD, root, {"tool_name": "Edit", "tool_input": {"file_path": str(cfg), "old_string": "{", "new_string": "{}"}})
+    record("guard | broken guard.json: Claude can still edit it to fix it", res.returncode == 0, res.stderr[:200])
+    cfg.write_text(json.dumps({"off_limits": ["docs/private/**"], "protect_tests": False, "block_force_push": False}))
+    record("guard | untrusted guard.json: added off_limits pattern blocks", read("docs/private/plan.md") == 2)
+    record("guard | untrusted guard.json: cannot drop the defaults", read(".env") == 2)
+    res = run_hook(GUARD, root, {"tool_name": "Bash", "tool_input": {"command": "git push -f"}, "cwd": str(root)})
+    record("guard | untrusted guard.json: cannot switch a protection off", res.returncode == 2)
+    trust(root)
+    record("guard | trusted guard.json: replaces the defaults (documented)", read(".env") == 0)
+    record("guard | trusted guard.json: its own pattern blocks", read("docs/private/plan.md") == 2)
     cfg.write_text(saved)
+    trust(root)
 
 
 # ---------------- Done Gate ----------------
@@ -234,10 +275,17 @@ def gate_event(root: Path, message: str = "Done. All tests pass.", session: str 
             "stop_hook_active": False, "last_assistant_message": message}
 
 
-def write_gate(root: Path, checks: List[Dict[str, str]], **extra: Any) -> None:
+def trust(root: Path) -> int:
+    return subprocess.run([sys.executable, str(GATE), "trust", str(root)], capture_output=True,
+                          env={**os.environ, "XDG_CONFIG_HOME": str(XDG)}).returncode
+
+
+def write_gate(root: Path, checks: List[Dict[str, str]], trusted: bool = True, **extra: Any) -> None:
     (root / ".claude").mkdir(exist_ok=True)
     (root / ".claude" / "done-gate.json").write_text(json.dumps({"checks": checks, **extra}))
     shutil.rmtree(root / ".claude" / ".done-gate", ignore_errors=True)
+    if trusted and checks:
+        trust(root)
 
 
 def decision(res: subprocess.CompletedProcess) -> Tuple[str, Dict[str, Any]]:
@@ -265,6 +313,18 @@ def run_gate(root: Path, counter: Path) -> None:
     write_gate(root, [])
     check("empty checks: allows", "allow", run_hook(GATE, root, gate_event(root)))
 
+    write_gate(root, [counting], trusted=False)
+    n0 = counter.read_text().count("run") if counter.exists() else 0
+    check("untrusted config: allows with a warning", "allow", run_hook(GATE, root, gate_event(root)),
+          lambda d: "not been trusted" in d.get("systemMessage", ""))
+    record("done-gate | untrusted config: its commands never run",
+           (counter.read_text().count("run") if counter.exists() else 0) == n0)
+    record("done-gate | trust command succeeds", trust(root) == 0)
+    (root / ".claude" / "done-gate.json").write_text(json.dumps({"checks": [counting, failing]}))
+    check("config changed after trust: untrusted again", "allow", run_hook(GATE, root, gate_event(root)),
+          lambda d: "not been trusted" in d.get("systemMessage", ""))
+    record("done-gate | trust store lives under XDG_CONFIG_HOME", (XDG / "greenbar" / "trusted.json").is_file())
+
     write_gate(root, [passing, counting])
     check("passing checks: allows and announces", "allow", run_hook(GATE, root, gate_event(root)),
           lambda d: "passed" in d.get("systemMessage", ""))
@@ -289,6 +349,22 @@ def run_gate(root: Path, counter: Path) -> None:
                  run_hook(GATE, root, gate_event(root, "Here is a summary of the change.", "s2")))
     record("done-gate | no claim: reason does not accuse", "says it is done" not in data.get("reason", ""))
 
+    def turn(session: str) -> None:
+        subprocess.run([sys.executable, str(GATE), "turn-start"], input=json.dumps(gate_event(root, session=session)),
+                       text=True, capture_output=True, cwd=str(root),
+                       env={**os.environ, "CLAUDE_PROJECT_DIR": str(root), "XDG_CONFIG_HOME": str(XDG)})
+
+    write_gate(root, [passing, counting])
+    turn("ask")
+    n = counter.read_text().count("run")
+    check("red suite, turn changed nothing: allows", "allow", run_hook(GATE, root, gate_event(root, "Use X or Y?", "ask")))
+    record("done-gate | red suite, turn changed nothing: checks not run", counter.read_text().count("run") == n)
+    turn("edit")
+    (root / "src" / "extra.py").write_text("Y = 2\n")
+    check("turn that changes files: checks run and block", "block", run_hook(GATE, root, gate_event(root, session="edit")))
+    check("same turn, still red after a block: keeps gating", "block", run_hook(GATE, root, gate_event(root, session="edit")))
+    (root / "src" / "extra.py").unlink()
+
     write_gate(root, [passing], max_consecutive_blocks=2)
     check("loop cap: 1st failure blocks", "block", run_hook(GATE, root, gate_event(root, session="cap")))
     check("loop cap: 2nd failure blocks", "block", run_hook(GATE, root, gate_event(root, session="cap")))
@@ -308,6 +384,11 @@ def run_gate(root: Path, counter: Path) -> None:
     write_gate(root, [{"name": "slow", "run": f"{py} -c 'import time; time.sleep(5)'"}], timeout_seconds=1)
     data = check("timeout counts as failure", "block", run_hook(GATE, root, gate_event(root)))
     record("done-gate | timeout is reported", "timed out" in data.get("reason", ""))
+
+    write_gate(root, [{"name": "a", "run": f"{py} -c 'import time; time.sleep(2)'"}, passing],
+               total_timeout_seconds=1)
+    data = check("total time budget: later checks fail, not hang", "block", run_hook(GATE, root, gate_event(root)))
+    record("done-gate | budget exhaustion is reported", "total budget" in data.get("reason", "") or "timed out" in data.get("reason", ""))
 
     write_gate(root, [failing])
     check("DONE_GATE_OFF=1 allows", "allow", run_hook(GATE, root, gate_event(root), {"DONE_GATE_OFF": "1"}))

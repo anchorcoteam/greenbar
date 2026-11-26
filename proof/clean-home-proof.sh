@@ -45,6 +45,7 @@ cd "$WORK/sample"
 PYTHONPATH=src python3 -m unittest -q 2>&1 | tail -1
 mkdir -p .claude
 printf '{"checks":[{"name":"tests","run":"PYTHONPATH=src python3 -m unittest -q"}]}\n' > .claude/done-gate.json
+python3 "$WORK/greenbar/plugins/greenbar/hooks/done_gate.py" trust "$PWD"
 printf '.claude/\n' >> .git/info/exclude
 printf 'API_KEY=fake-value-for-the-break-test\n' > .env
 printf '.env\n' >> .git/info/exclude

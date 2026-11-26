@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import fnmatch
 import glob
+import hashlib
 import json
 import os
 import re
@@ -35,7 +36,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 
 DEFAULTS: Dict[str, Any] = {
     "off_limits": [
-        ".env", ".env.*", "!.env.example", "!.env.sample", "!.env.template",
+        ".env", ".env.*", "!*.example", "!*.sample", "!*.template", "!*.dist",
         "*.pem", "*.key", "id_rsa*", "id_ed25519*", "secrets/**", ".secrets/**",
     ],
     "read_only": [],
@@ -43,6 +44,7 @@ DEFAULTS: Dict[str, Any] = {
     "test_files": [
         "test_*.py", "*_test.py", "tests/**", "test/**", "__tests__/**", "spec/**",
         "*.test.*", "*.spec.*", "*_test.go", "*Test.java", "*_spec.rb",
+        "!__snapshots__/**", "!.pytest_cache/**", "!__pycache__/**", "!*.pyc", "!*.snap",
     ],
     "protect_tests": True,
     "never_commit": [".env", ".env.*", "!.env.example", "!.env.sample", "*.pem", "*.key", "id_rsa*"],
@@ -51,7 +53,9 @@ DEFAULTS: Dict[str, Any] = {
     "block_no_verify": True,
     "block_destructive_git": True,
     "block_rm_rf_roots": True,
+    "block_env_dump": True,
 }
+LIST_KEYS = ("off_limits", "read_only", "locked_once_committed", "test_files", "never_commit")
 SENSITIVE_HOME = (".ssh", ".aws", ".gnupg", ".netrc", ".docker", ".kube", ".pypirc",
                   ".config/gcloud", ".azure", ".npmrc")
 FILE_TOOLS = {"Read", "Edit", "Write", "MultiEdit", "NotebookEdit"}
@@ -78,6 +82,11 @@ SKIP_MARKER = re.compile(
     r"\b(it|test|describe|context)\.(skip|todo)\(|\b(xit|xtest|xdescribe)\(|"
     r"\bt\.Skip(Now|f)?\(|#\[ignore\]|@Disabled\b|@Ignore\b|\bskip:\s*true\b"
 )
+TEST_DEF = re.compile(
+    r"^\s*(?:async\s+)?def\s+test\w*\s*\(|^\s*(?:it|test)\s*\(\s*['\"`]|"
+    r"^\s*func\s+Test\w+\s*\(|^\s*#\[test\]|^\s*@Test\b",
+    re.MULTILINE,
+)
 SECRET = re.compile(
     r"AKIA[0-9A-Z]{16}"
     r"|sk_live_[0-9a-zA-Z]{16,}|rk_live_[0-9a-zA-Z]{16,}"
@@ -85,7 +94,8 @@ SECRET = re.compile(
     r"|gh[pousr]_[0-9a-zA-Z]{30,}|github_pat_[0-9a-zA-Z_]{30,}"
     r"|xox[baprs]-[0-9a-zA-Z-]{10,}|AIza[0-9A-Za-z_-]{35}"
     r"|-----BEGIN [A-Z ]*PRIVATE KEY-----"
-    r"|(?i:password|passwd|secret|api[_-]?key|token)\w*[\"']?\s*[:=]\s*[\"'][^\"'\s]{12,}[\"']"
+    r"|(?i:(?<![a-z0-9])(?:[a-z0-9]+_)?(?:password|passwd|secret|api[_-]?key|token)s?(?![a-z0-9]))"
+    r"[\"']?\s*[:=]\s*[\"'][^\"'\s]{12,}[\"']"
 )
 
 
@@ -129,10 +139,10 @@ class Rules:
             text = text[1:] if negate else text
             if not text:
                 continue
-            anchored = "/" in text.rstrip("/").replace("**/", "", 1) if text.startswith("**/") else "/" in text.rstrip("/")
-            core = text.lstrip("/")
+            core = text.lstrip("/") if not text.startswith("**/") else text[3:]
             while core.endswith("/**") or core.endswith("/"):
                 core = core[:-3] if core.endswith("/**") else core[:-1]  # "dir/**" also matches "dir"
+            anchored = "/" in core or (text.startswith("/") and not text.startswith("**/"))
             body = glob_to_regex(core)
             rx = re.compile(("" if anchored else "(?:.*/)?") + body + "(?:/.*)?$", re.IGNORECASE)
             (self.exclude if negate else self.include).append(rx)
@@ -146,18 +156,60 @@ class Rules:
         return any(rx.match(rel) for rx in self.include)
 
 
+def trust_entry(root: Path) -> Dict[str, Any]:
+    """This folder's record in the trust store that `done_gate.py trust` writes (outside the repo)."""
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    try:
+        data = json.loads((Path(base) / "greenbar" / "trusted.json").read_text(encoding="utf-8"))
+        entry = data.get(str(root)) if isinstance(data, dict) else None
+        return entry if isinstance(entry, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def file_digest(path: Path) -> Optional[str]:
+    try:
+        return "symlink" if path.is_symlink() else hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def off_stamp(path: Path) -> Optional[str]:
+    """Identity of the guard.off file the user trusted: a re-created file does not match."""
+    try:
+        st = path.lstat()
+        return f"{st.st_ino}:{st.st_mtime_ns}"
+    except OSError:
+        return None
+
+
+def tighten_only(data: Dict[str, Any]) -> Dict[str, Any]:
+    """An untrusted repo's guard.json may add rules but never remove or relax one."""
+    merged = dict(DEFAULTS)
+    for key in LIST_KEYS:
+        extra = [p for p in data.get(key) or [] if isinstance(p, str) and not p.startswith("!")]
+        merged[key] = list(DEFAULTS[key]) + extra
+    for key, value in DEFAULTS.items():
+        if isinstance(value, bool) and data.get(key) is True:
+            merged[key] = True
+    return merged
+
+
 class Config:
     def __init__(self, root: Path) -> None:
         data: Dict[str, Any] = {}
         path = root / ".claude" / "guard.json"
+        self.error = ""
         if path.is_file():
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
-            except ValueError as exc:
-                block(f"cannot parse {path} ({exc}). Fix it so the guard can run.")
-            if not isinstance(data, dict):
-                block(f"{path} must contain a JSON object.")
-        merged = {**DEFAULTS, **data}
+                if not isinstance(data, dict):
+                    raise ValueError("it must contain a JSON object")
+            except (OSError, ValueError) as exc:
+                self.error = f"{path} is unreadable ({exc}); using the default rules"
+                data = {}
+        trusted = bool(data) and trust_entry(root).get("guard") == file_digest(path)
+        merged = {**DEFAULTS, **data} if trusted else tighten_only(data)
         self.flags = merged
         self.off_limits = Rules(merged["off_limits"])
         self.read_only = Rules(merged["read_only"])
@@ -249,15 +301,22 @@ def check_test_tamper(tool: str, tool_input: Dict[str, Any], rel: str, root: Pat
     if len(SKIP_MARKER.findall(new)) > len(SKIP_MARKER.findall(old)):
         block(f"this change adds a skip/ignore marker to the test file {rel}. Fix the code "
               "or the test instead; if a test really must be skipped, ask the user first.")
+    if len(TEST_DEF.findall(new)) < len(TEST_DEF.findall(old)):
+        block(f"this change removes tests from {rel}. Fix the code instead; if a test is really "
+              "obsolete, ask the user to remove it.")
 
 
 def check_file_tool(tool: str, tool_input: Dict[str, Any], root: Path, cfg: Config) -> None:
     target = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
-    if names_sensitive_home(str(Path(target).expanduser())):
+    try:
+        resolved = str(Path(target).expanduser().resolve())
+    except (OSError, RuntimeError):
+        resolved = target
+    if names_sensitive_home(str(Path(target).expanduser())) or names_sensitive_home(resolved):
         block("that file is in a credential folder in your home directory.")
     rel = relative(target, root)
-    if rel is None:
-        return
+    if rel is None or rel in (".claude/guard.json", ".claude/guard.off"):
+        return  # outside the project, or the guard's own config (so a broken one can be fixed)
     if cfg.off_limits.match(rel):
         block(f"{rel} is off limits in this repo (guard.json, off_limits).")
     if tool in WRITE_TOOLS:
@@ -303,19 +362,29 @@ def segments(words: List[str]) -> List[range]:
 
 def command_name(words: List[str], seg: range) -> str:
     """The program a segment runs, skipping `sudo`, `env`, `VAR=x` and `command` prefixes."""
+    prefix, skip_next = False, False
     for i in seg:
         w = words[i]
-        if "=" in w and not w.startswith("-") or w in ("sudo", "command", "nohup", "time"):
+        if skip_next:
+            skip_next = False
+            continue
+        if ("=" in w and not w.startswith("-")) or w in PREFIXES or (prefix and w.startswith("-")):
+            prefix = prefix or w in PREFIXES
+            skip_next = prefix and w in PREFIX_ARG_FLAGS
             continue
         return os.path.basename(w)
     return ""
 
 
+PREFIXES = {"sudo", "command", "nohup", "time", "env", "nice", "exec", "builtin", "doas"}
+PREFIX_ARG_FLAGS = {"-u", "-g", "-C", "-p", "-U", "-h", "--user", "--group", "--chdir"}
+
+
 def bare_path_args(words: List[str]) -> Set[int]:
     picked: Set[int] = set()
     for seg in segments(words):
-        name = os.path.basename(words[seg[0]])
-        positional = [i for i in seg[1:] if not words[i].startswith("-")]
+        name = command_name(words, seg)
+        positional = [i for i in seg[1:] if not words[i].startswith("-") and os.path.basename(words[i]) != name]
         if name in SEARCH_COMMANDS:
             picked.update(positional[1:])
         elif name in FILE_COMMANDS:
@@ -345,11 +414,34 @@ def deleted_targets(words: List[str]) -> Set[int]:
         args = [i for i in seg[1:] if not words[i].startswith("-")]
         if name in ("rm", "unlink", "shred"):
             found.update(args)
-        elif name == "git" and len(args) > 1 and words[args[0]] == "rm":
+        elif name == "git" and len(args) > 1 and words[args[0]] == "rm" and "--cached" not in [words[i] for i in seg]:
             found.update(args[1:])
-        elif name == "mv" and len(args) > 1:
-            found.update(args[:-1])
     return found
+
+
+def moved_out_of_tests(words: List[str], root: Path, start: Path, cfg: Config) -> List[str]:
+    """Test files that `mv` / `git mv` would move somewhere that is not a test path."""
+    out: List[str] = []
+    dirs = working_dirs(words, start)
+    for seg in segments(words):
+        name = command_name(words, seg)
+        args = [i for i in seg[1:] if not words[i].startswith("-")]
+        if name == "git" and args and words[args[0]] == "mv":
+            args = args[1:]
+        elif name != "mv":
+            continue
+        if len(args) < 2:
+            continue
+        dest = relative(words[args[-1]], root, dirs[args[-1]])
+        if dest is not None and cfg.tests.match(dest.rstrip("/") + "/x_test.py"):
+            continue  # moved into another test location
+        if dest is not None and cfg.tests.match(dest):
+            continue
+        for i in args[:-1]:
+            rel = relative(words[i], root, dirs[i])
+            if rel is not None and cfg.tests.match(rel):
+                out.append(rel)
+    return out
 
 
 def working_dirs(words: List[str], start: Path) -> List[Path]:
@@ -424,18 +516,46 @@ def check_rm_rf(words: List[str], root: Path, start: Path) -> None:
             w = words[i]
             if w.startswith("-"):
                 continue
-            if w in ("/", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "..", "../", "*", ".", "./"):
+            inside_sub = dirs[i] != root and is_within(dirs[i], root)
+            if w in ("/", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "..", "../", ".", "./") or (
+                w == "*" and not inside_sub
+            ):
                 block(f"`rm -r {w}` would delete far more than intended. Name the exact paths.")
-            target = Path(w).expanduser()
+            if w == "*":
+                continue
+            here = str(dirs[i])
+            w = re.sub(r"\$\{?PWD\}?", lambda _m, h=here: h, w)
+            target = Path(os.path.expandvars(w)).expanduser()
             target = (target if target.is_absolute() else dirs[i] / target).resolve()
-            if target in (Path.home(), Path("/")) or root.is_relative_to(target):
+            if target in (Path.home(), Path("/")) or is_within(root, target):
                 block(f"`rm -r {w}` would delete the project or a folder that contains it.")
 
 
+def is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
 def check_git(command: str, cfg: Config) -> Set[str]:
+    """Check each git invocation on its own words, so `git push && rm -f x` is not a force push."""
+    words = split_words(command)
+    subs: Set[str] = set()
+    for seg in segments(words):
+        if command_name(words, seg) == "git":
+            text = " ".join(shlex.quote(words[i]) for i in seg)
+            subs |= check_git_segment(text, cfg)
+    return subs
+
+
+def check_git_segment(command: str, cfg: Config) -> Set[str]:
     subs = {m.group(1) for m in GIT_COMMAND.finditer(command)}
     if not subs:
         return subs
+    if cfg.flags["block_no_verify"] and re.search(r"core\.hooksPath", command, re.IGNORECASE):
+        block("overriding core.hooksPath switches off the repo's own git hooks. Fix what they report instead.")
     if re.search(r"--output\b|--no-index\b|--ext-diff\b", command):
         block("git options that read or write arbitrary files are not allowed here.")
     force = r"(?<!\S)(?:--force\S*|-\w*f\w*|\+\S+)(?!\S)"
@@ -507,12 +627,55 @@ def check_commit(root: Path, scope: str, cfg: Config) -> None:
                   "variable. If it is a false alarm, the user can commit by hand.")
 
 
-def check_bash(command: str, root: Path, start: Path, cfg: Config) -> None:
+HEREDOC = re.compile(r"<<-?\s*(['\"]?)(\w+)\1[^\n]*\n.*?\n\s*\2\s*(?=\n|$)", re.DOTALL)
+SUBSHELL = re.compile(r"\$\(([^()]*)\)|`([^`]*)`")
+SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "fish"}
+ENV_DUMP = {"printenv", "env", "export", "set", "declare"}
+
+
+def nested_commands(words: List[str]) -> List[str]:
+    """Command strings run by `bash -c '...'`, `eval ...` and `$(...)`, checked like the outer one."""
+    found: List[str] = []
+    for seg in segments(words):
+        name = command_name(words, seg)
+        idx = list(seg)
+        if name in SHELLS:
+            for j, i in enumerate(idx):
+                if words[i] in ("-c", "-lc", "-ic") and j + 1 < len(idx):
+                    found.append(words[idx[j + 1]])
+        elif name == "eval":
+            found.append(" ".join(words[i] for i in idx[1:]))
+    return found
+
+
+def check_env_dump(words: List[str]) -> None:
+    for seg in segments(words):
+        name = command_name(words, seg)
+        first = os.path.basename(words[seg[0]])
+        rest = [words[i] for i in seg[1:]]
+        bare_env = first == "env" and name == ""  # `env` or `env FOO=bar` with no program
+        if name == "printenv" or bare_env or (
+            name in ("export", "set", "declare") and all(w.startswith("-") for w in rest)
+        ):
+            name = name or "env"
+            block(f"`{name}` prints every environment variable, secrets included, into the transcript. "
+                  "Print the one variable you need, e.g. `echo $NODE_ENV`.")
+
+
+def check_bash(command: str, root: Path, start: Path, cfg: Config, depth: int = 0) -> None:
+    command = HEREDOC.sub(" ", command)  # heredoc text is data (a README), not paths to read
     command = MESSAGE_ARG.sub(" ", command)  # a commit message may mention .env
+    if depth < 3:
+        for inner in [a or b for a, b in SUBSHELL.findall(command)]:
+            check_bash(inner, root, start, cfg, depth + 1)
+        for inner in nested_commands(split_words(command)):
+            check_bash(inner, root, start, cfg, depth + 1)
     if names_sensitive_home(command):
         block("this command reaches into a credential folder in your home directory.")
     words = split_words(command)
     check_find_patterns(words, cfg)
+    if cfg.flags["block_env_dump"]:
+        check_env_dump(words)
     named = paths_named(words, root, start)
     off = sorted({rel for rel in named if cfg.off_limits.match(rel)})
     if off:
@@ -526,7 +689,7 @@ def check_bash(command: str, root: Path, start: Path, cfg: Config) -> None:
             block(problem)
     if cfg.flags["protect_tests"]:
         deleted = paths_named(words, root, start, only=deleted_targets(words))
-        tests = sorted({rel for rel in deleted if cfg.tests.match(rel)})
+        tests = sorted({rel for rel in deleted if cfg.tests.match(rel)} | set(moved_out_of_tests(words, root, start, cfg)))
         if tests:
             block(f"this deletes test files ({', '.join(tests[:3])}). Ask the user before removing tests.")
     subs = check_git(command, cfg)
@@ -542,9 +705,11 @@ def main() -> None:
         if not isinstance(tool, str) or not isinstance(tool_input, dict):
             raise TypeError("unexpected hook input shape")
     except (ValueError, KeyError, TypeError) as exc:
-        block(f"could not read the hook input ({exc}), so the action was blocked.")
+        print(f"greenbar guard: could not read the hook input ({exc}); not checked.", file=sys.stderr)
+        sys.exit(1)  # non-blocking error: a future input format must not brick every tool call
     root = project_dir()
-    if (root / ".claude" / "guard.off").exists():
+    off = root / ".claude" / "guard.off"
+    if off.exists() and trust_entry(root).get("guard-off") == off_stamp(off):
         sys.exit(0)
     cfg = Config(root)
     if tool in FILE_TOOLS:
@@ -558,4 +723,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if sys.version_info < (3, 9):
+        print("greenbar guard needs Python 3.9 or newer; not checked.", file=sys.stderr)
+        sys.exit(1)
     main()
